@@ -172,3 +172,11 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+artifacts/
+*.rdb
+*.index
+temp.ipynb
+temp.py
+.DS_Store
+*.png
