@@ -9,7 +9,6 @@ torchaudio
 pillow
 transformers
 faiss-cpu
-git+https://github.com/SauravMaheshkar/samv2.git
 redis
 timm
 einops

@@ -3,9 +3,8 @@ from fastapi.responses import StreamingResponse
 from typing import List, Literal
 from typing import AsyncGenerator
 from pydantic import BaseModel
-from sam2 import load_model
-from sam2.sam2_image_predictor import SAM2ImagePredictor
 from utils.redis_connection import redis_client
+from utils.models import  DetectBBOxesAndMasks
 import json
 import requests
 import os
@@ -31,23 +30,25 @@ from transformers import CLIPProcessor, CLIPModel
 feat_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
 processor_clip = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 
-
-device = "cuda:0" if torch.cuda.is_available() else "cpu"
-model_id = 'microsoft/Florence-2-base'
-florence_model = AutoModelForCausalLM.from_pretrained(model_id, trust_remote_code=True, torch_dtype='auto').eval().to(device)
-processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-
+# Initialize the object detection and segmentation models
+detection_models = DetectBBOxesAndMasks(
+    detector_id="google/owlv2-base-patch16-ensemble",
+    segmenter_id="facebook/sam-vit-base",
+    threshold=0.5
+)
 
 # Create a directory for mask images if it doesn't exist
 MASK_DIR = Path("static/masks")
 MASK_DIR.mkdir(parents=True, exist_ok=True)
 
-# api_key = os.getenv('API_KEY', 'vd7rF1WgLJD1')
-# api_base = "https://dg-kube.nix.cccis.com/llm-inference-dev/api"
-# model = "Phi-4-multimodal-instruct"
+# Load LLAMA Model Endpoint
 api_key = os.getenv('API_KEY', "vd7rF1WgLJQ1")
 api_base = "https://dg-kube.nix.cccis.com/llm-inference-prod2/api"
 model = "Llama-4-Scout-17B-16E-Instruct"
+
+api_key_text = os.getenv('API_KEY', 'vd7rF1WgLJD1')
+api_base_text = "https://dg-kube.nix.cccis.com/llm-inference-dev/api"
+model_text = "Phi-4-multimodal-instruct"
 
 bbox_pattern = r"^\(\s*(-?\d+(\.\d+)?),\s*(-?\d+(\.\d+)?),\s*(-?\d+(\.\d+)?),\s*(-?\d+(\.\d+)?)\s*\)$"
 
@@ -58,12 +59,48 @@ class AnnotationRequest(BaseModel):
     annotationTypes: List[str]
 
 
-seg_model = load_model(
-    variant="tiny",
-    ckpt_path="artifacts/sam2_hiera_tiny.pt",
-    device="cpu"
-)
-image_predictor = SAM2ImagePredictor(seg_model)
+def query_vlm_with_text(query) -> None:
+    payload = {
+        "model": model_text,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Given this text query, return the object of interest in the image. For example if the query is 'people on the beach', the object of interest is 'a person'. Your task is to simply return the object of interest in the image but should be followed by 'a'. Do not return any other information.. no explaination, no reasoning, just the object of interest.",
+                    },
+                    {
+                        "type": "text",
+                        "text": f"HERE is the query :- '{query}'"
+                    }
+                ]
+            }
+        ],
+        "max_completion_tokens": 6400
+    }
+    
+    # Set up headers
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key_text}"
+    }
+    
+    # Make the API request
+    response = requests.post(
+        f"{api_base_text}/chat/completions",
+        headers=headers,
+        json=payload
+    )
+    
+    # Process the response
+    if response.status_code == 200:
+        result = response.json()
+        return result["choices"][0]["message"]["content"]
+    else:
+        print(f"Error: {response.status_code}")
+        print(response.text)
+    return None
 
 
 def get_image_embedding_from_url(image_url: str):
@@ -89,29 +126,6 @@ def query_faiss(index, image_path: str, k: int = 1):
 
     # Return the results
     return distances[0], indices[0]
-
-def run_example(image, task_prompt = '<OD>', text_input=None):
-    if text_input is None:
-        prompt = task_prompt
-    else:
-        prompt = task_prompt + text_input
-    inputs = processor(text=prompt, images=image, return_tensors="pt").to(device, torch.float16)
-    generated_ids = florence_model.generate(
-      input_ids=inputs["input_ids"],
-      pixel_values=inputs["pixel_values"],
-      max_new_tokens=1024,
-      early_stopping=False,
-      do_sample=False,
-      num_beams=3,
-    )
-    generated_text = processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
-    parsed_answer = processor.post_process_generation(
-        generated_text, 
-        task=task_prompt, 
-        image_size=(image.width, image.height)
-    )
-
-    return parsed_answer
 
 
 # Update the save_image_with_bbox function to also save a mask image
@@ -189,8 +203,7 @@ def query_vlm_with_image_llama(
     endpoint = f"{api_base}/chat/completions"
     
     # Chat completions format
-    image_base64, width, height = encode_local_image(image_path)
-    # prompt = f"The image has following dimentions width - {width} and height - {height}. {prompt}"
+    image_base64, _, _ = encode_local_image(image_path)
     content = []
     content.append({
         "type": "image_url",
@@ -223,11 +236,11 @@ def query_vlm_with_image_llama(
     # Process the response
     if response.status_code == 200:
         result = response.json()
-        return result["choices"][0]["message"]["content"], width, height
-    else:
-        print(f"Error: {response.status_code}")
-        print(response.text)
-    return "", width, height
+        return result["choices"][0]["message"]["content"]
+    
+    print(f"Error: {response.status_code}")
+    print(response.text)
+    return 0
 
 
 def query_vlm_with_local_image(image_path: str, query: str) -> None:
@@ -372,72 +385,37 @@ def rescale_boxes_to_xyxy(boxes, img_width, img_height, scale=1000):
     return rescaled
 
 def get_annotations(index, images: List[str], query: str, sim_threshold=0.85):
+    simple_prompt = query_vlm_with_text(query)
     for i, img in enumerate(images):
-        # category = "each person in the image"
-        # prompt = f"""Detect all objects belonging to the category '{category}' in the image, and provide the bounding boxes (between 0 and 1000, integer) and confidence (between 0 and 1, with two decimal places). 
-        #         If no object belonging to the category '{category}' is in the image, return 'No Objects'.
-        #         Output the thinking process in <think> </think> and the final answer in <answer> </answer> tags.
-        #         The final answer must be a **valid Python list of dictionaries**, where each dictionary has:
-        #         - 'Position': [x1, y1, x2, y2] (integers between 0 and 1000)
-        #         - 'Confidence': float (between 0 and 1, rounded to two decimal places)
-        #         The output answer format should be exactly:
-        #         <think> ... </think>
-        #         <answer>[{{'Position': [x1, y1, x2, y2], 'Confidence': 0.92}}, ...]</answer>
-        #         Please strictly follow this format and syntax."""
-                
         try:
             distances, _ = query_faiss(index, img, k=1)
             if distances[0] < sim_threshold:
                 print(f"Image {img} is not similar enough to the query.")
                 yield [], [], None, None
                 continue
-            image = Image.open(requests.get(img, stream=True).raw)
-            width, height = image.size
-            results = run_example(image, task_prompt='<CAPTION_TO_PHRASE_GROUNDING>', text_input=query)
-            bboxes = results['<CAPTION_TO_PHRASE_GROUNDING>']['bboxes']
+            
+            prompt = f"How many objects are there in the image matching the query '{query}', Return the number of objects in the image. The output should be strictly a number. If no object is found, return 0. Only RETURN number nothing else, no text or explaination needed"
+            output = query_vlm_with_image_llama(img, prompt)      
+            num_objects = int(output.strip())
 
+            image = detection_models.load_image(img)
+            width, height = image.size
+            results = detection_models.detect(image, [simple_prompt])
+            bboxes = detection_models.get_boxes(results)[0]
             if not bboxes:
                 print(f"No bbox found")
                 yield [], [], None, None
                 continue
             
-            # Convert PIL image to numpy array for SAM
-            image_np = np.array(image.convert("RGB"))
-            image_predictor.set_image(image_np)
+            results = detection_models.segment(image, results)
+            masks, bboxes = detection_models.get_masks(results, num_objects)
             
-            # Use all bounding boxes
-            multi_box_coords = np.array(bboxes)
-            
-            # Debug output
-            print(f"Image dimensions: {width}x{height}")
-            print(f"Number of boxes: {len(bboxes)}")
-            
-            # Predict masks for all bounding boxes
-            masks, scores, _ = image_predictor.predict(
-                point_coords=None,
-                point_labels=None,
-                box=multi_box_coords,
-                multimask_output=False,
-            )
-            print("MASK SHAPES : ", masks.shape)
-            # Check if we have masks
-            if masks is None or masks.shape[0] == 0:
-                print("No masks generated")
-                yield bboxes, [], None, [height, width]
-                continue
-                
-            # List to store mask URLs
             mask_urls = []
-            
             # Process each mask and save it
             for mask_idx, mask in enumerate(masks):
-                if len(masks.shape) == 4:
-                    mask = mask[0]  # Get the first mask
-                # Generate a unique filename for the mask
                 mask_filename = f"mask_{i}_{mask_idx}_{uuid.uuid4().hex}.png"
                 mask_path = MASK_DIR / mask_filename
                 
-                # Make sure the mask has the exact same dimensions as the image
                 if mask.shape != (height, width):
                     print(f"Warning: Mask shape {mask.shape} doesn't match image shape ({height}, {width})")
                     # Resize the mask if needed
@@ -448,13 +426,11 @@ def get_annotations(index, images: List[str], query: str, sim_threshold=0.85):
                 # Save the mask as a PNG
                 mask_image = Image.fromarray((mask * 255).astype(np.uint8))
                 mask_image.save(mask_path)
-                print(f"Mask {mask_idx} saved to: {mask_path}")
-                
+                # print(f"Mask {mask_idx} saved to: {mask_path}")
                 # Add the URL to the list
                 mask_urls.append(f"/static/masks/{mask_filename}")
             
-            # Return the bboxes, mask_urls, scores, and shape
-            yield bboxes, mask_urls, scores, [height, width]
+            yield bboxes, mask_urls, None, [height, width]
                 
         except Exception as e:
             print(f"Error processing image {img}: {e}")
@@ -481,6 +457,6 @@ def generate_annotations(request: AnnotationRequest, user_id: str):
 
     # Return a StreamingResponse that streams the annotations
     return StreamingResponse(
-        stream_annotations(index, images[:1], query),
+        stream_annotations(index, images[:10], query),
         media_type="application/json"
     )
