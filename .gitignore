@@ -180,3 +180,10 @@ temp.ipynb
 temp.py
 .DS_Store
 *.png
+
+
+test*
+to_do.md
+spec.md
+models/
+.vscode/

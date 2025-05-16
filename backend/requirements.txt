@@ -13,3 +13,10 @@ redis
 timm
 einops
 pytest
+opencv-python
+json5
+regex
+python-dotenv
+scipy
+black
+isort
